@@ -35,19 +35,31 @@ const (
 )
 
 var (
-	mu       sync.Mutex
+	mu sync.Mutex
+
+	toaLock sync.RWMutex
+
 	ruleSpec []string
 	opt      options
 )
 
 type tcpOptions struct {
-	v [6]byte
+	v    [6]byte
+	use  bool
+	lock *sync.RWMutex
+	cond *sync.Cond
 }
 
 var (
 	tcpOptionsPool = sync.Pool{
 		New: func() interface{} {
-			return &tcpOptions{}
+
+			var lock sync.RWMutex
+
+			return &tcpOptions{
+				lock: &lock,
+				cond: sync.NewCond(&lock),
+			}
 		},
 	}
 	c = cache.New(1*time.Minute, 2*time.Minute)
@@ -103,6 +115,9 @@ func dialWithRetry(addr string, clientIp string, clientPort int) (net.Conn, erro
 }
 
 func dial(addr string, clientIp string, clientPort int) (net.Conn, error) {
+	// mu.Lock()
+	// defer mu.Unlock()
+
 	lAddr, err := getAvailableAddr()
 
 	if err != nil {
@@ -156,42 +171,55 @@ func (n *netFilter) Run() {
 
 					if tcpLayer := pack.Packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
 						tcp := tcpLayer.(*layers.TCP)
-
 						sp := int(tcp.SrcPort)
-
 						// fmt.Printf("%v,%v\n", sp, tcp)
-						if v, ok := getTcpOptions(sp); ok && tcp.ACK {
-							defer closeTcpOptions(sp)
+						if v, ok := getTcpOptionsRaw(sp); ok {
+							if tcp.ACK && len(tcp.Payload) == 0 {
+								v.lock.Lock()
+
+								defer v.lock.Unlock()
+								defer v.cond.Broadcast()
+								defer closeTcpOptions(sp)
+
+								tcp.Options = append(tcp.Options, layers.TCPOption{
+									OptionType:   optionType,
+									OptionLength: uint8(len(v.v) + 2),
+									OptionData:   v.v[:],
+								})
+
+								var options gopacket.SerializeOptions = gopacket.SerializeOptions{
+									FixLengths:       true,
+									ComputeChecksums: true,
+								}
+								buffer := gopacket.NewSerializeBuffer()
+								err := tcp.SetNetworkLayerForChecksum(ipv4)
+
+								if err != nil {
+									fmt.Fprintf(os.Stderr, "SetNetworkLayerForChecksum err: %v\n", err)
+									return
+								}
+								err = gopacket.SerializeLayers(buffer, options,
+									ipv4,
+									tcp,
+									gopacket.Payload(tcp.Payload),
+								)
+
+								if err != nil {
+									fmt.Fprintf(os.Stderr, "SerializeLayers err: %v\n", err)
+									return
+								}
+								pack.SetVerdictWithPacket(netfilter.NF_ACCEPT, buffer.Bytes())
+							} else if !tcp.SYN {
+								v.lock.Lock()
+								for hasTcpOptions(sp) {
+									v.cond.Wait()
+								}
+								pack.SetVerdict(netfilter.NF_ACCEPT)
+								v.lock.Unlock()
+							} else {
+								pack.SetVerdict(netfilter.NF_ACCEPT)
+							}
 							// fmt.Printf("%v,%v\n", sp, v)
-							tcp.Options = append(tcp.Options, layers.TCPOption{
-								OptionType:   optionType,
-								OptionLength: uint8(len(v) + 2),
-								OptionData:   v,
-							})
-
-							var options gopacket.SerializeOptions = gopacket.SerializeOptions{
-								FixLengths:       true,
-								ComputeChecksums: true,
-							}
-							buffer := gopacket.NewSerializeBuffer()
-							err := tcp.SetNetworkLayerForChecksum(ipv4)
-
-							if err != nil {
-								fmt.Fprintf(os.Stderr, "SetNetworkLayerForChecksum err: %v\n", err)
-								return
-							}
-							err = gopacket.SerializeLayers(buffer, options,
-								ipv4,
-								tcp,
-								gopacket.Payload(tcp.Payload),
-							)
-
-							if err != nil {
-								fmt.Fprintf(os.Stderr, "SerializeLayers err: %v\n", err)
-								return
-							}
-							pack.SetVerdictWithPacket(netfilter.NF_ACCEPT, buffer.Bytes())
-
 						} else {
 							pack.SetVerdict(netfilter.NF_ACCEPT)
 						}
@@ -199,7 +227,6 @@ func (n *netFilter) Run() {
 				} else {
 					pack.SetVerdict(netfilter.NF_ACCEPT)
 				}
-
 			})
 		}
 	}
@@ -228,8 +255,7 @@ func clearIptables() error {
 }
 
 func getAvailableAddr() (net.Addr, error) {
-	mu.Lock()
-	defer mu.Unlock()
+
 	l, err := net.ListenTCP("tcp", nil)
 	if err != nil {
 		return nil, err
@@ -240,12 +266,35 @@ func getAvailableAddr() (net.Addr, error) {
 }
 
 func newTcpOptions(srcPort int, ip net.IP, port int) error {
+	toaLock.Lock()
+	defer toaLock.Unlock()
 
 	tcpOptions := tcpOptionsPool.Get().(*tcpOptions)
+	tcpOptions.use = true
+
 	binary.BigEndian.PutUint16(tcpOptions.v[:2], uint16(port))
 	copy(tcpOptions.v[2:], ip.To4())
 	c.SetDefault(strconv.Itoa(srcPort), tcpOptions)
+
 	return nil
+}
+
+func getTcpOptionsRaw(srcPort int) (*tcpOptions, bool) {
+	toaLock.RLock()
+	defer toaLock.RUnlock()
+
+	k := strconv.Itoa(srcPort)
+	if v, ok := c.Get(k); ok {
+		o := v.(*tcpOptions)
+		return o, ok
+	}
+	return nil, false
+}
+
+func hasTcpOptions(srcPort int) bool {
+	k := strconv.Itoa(srcPort)
+	_, ok := c.Get(k)
+	return ok
 }
 
 func getTcpOptions(srcPort int) ([]byte, bool) {
@@ -258,11 +307,13 @@ func getTcpOptions(srcPort int) ([]byte, bool) {
 }
 
 func closeTcpOptions(srcPort int) {
-	k := strconv.Itoa(srcPort)
+	toaLock.Lock()
+	defer toaLock.Unlock()
 
+	k := strconv.Itoa(srcPort)
 	if v, ok := c.Get(k); ok {
 		c.Delete(k)
-		defer tcpOptionsPool.Put(v)
+		tcpOptionsPool.Put(v)
 	}
 }
 
