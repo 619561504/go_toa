@@ -57,5 +57,5 @@ func Dial(addr string, clientIp string, clientPort int) (net.Conn, error) {
 	return dialWithRetry(addr, clientIp, clientPort)
 }
 func Close() error {
-	return close()
+	return cl()
 }
