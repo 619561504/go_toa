@@ -16,6 +16,6 @@ func dialWithRetry(addr string, ip string, port int) (net.Conn, error) {
 	return net.Dial("tcp", addr)
 }
 
-func close() error {
+func cl() error {
 	return nil
 }

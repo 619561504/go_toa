@@ -8,6 +8,7 @@ package go_toa
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"github.com/AkihiroSuda/go-netfilter-queue"
 	"github.com/avast/retry-go/v4"
@@ -15,7 +16,6 @@ import (
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/patrickmn/go-cache"
-	"github.com/sourcegraph/conc/pool"
 	"net"
 	"os"
 	"strconv"
@@ -35,34 +35,26 @@ const (
 )
 
 var (
-	mu sync.Mutex
-
-	toaLock sync.RWMutex
-
+	mu       sync.Mutex
 	ruleSpec []string
 	opt      options
+	toaLock  sync.Mutex
 )
 
 type tcpOptions struct {
-	v    [6]byte
-	use  bool
-	lock *sync.RWMutex
-	cond *sync.Cond
+	v [6]byte
+	c int
 }
 
 var (
 	tcpOptionsPool = sync.Pool{
 		New: func() interface{} {
-
-			var lock sync.RWMutex
-
-			return &tcpOptions{
-				lock: &lock,
-				cond: sync.NewCond(&lock),
-			}
+			return &tcpOptions{}
 		},
 	}
 	c = cache.New(1*time.Minute, 2*time.Minute)
+
+	channels []chan *netfilter.NFPacket
 )
 
 type netFilter struct {
@@ -115,9 +107,6 @@ func dialWithRetry(addr string, clientIp string, clientPort int) (net.Conn, erro
 }
 
 func dial(addr string, clientIp string, clientPort int) (net.Conn, error) {
-	// mu.Lock()
-	// defer mu.Unlock()
-
 	lAddr, err := getAvailableAddr()
 
 	if err != nil {
@@ -159,32 +148,33 @@ func dial(addr string, clientIp string, clientPort int) (net.Conn, error) {
 }
 
 func (n *netFilter) Run() {
+	channels = make([]chan *netfilter.NFPacket, opt.maxGoroutines)
+	for i, _ := range channels {
+		index := i
+		channels[index] = make(chan *netfilter.NFPacket, 1000)
+		go func() {
+			c := channels[index]
+			for {
+				select {
+				case pack := <-c:
+					if pack == nil {
+						return
+					}
+					if ipLayer := pack.Packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
+						ipv4 := ipLayer.(*layers.IPv4)
 
-	goPool := pool.New().WithMaxGoroutines(opt.maxGoroutines)
-	c := n.q.GetPackets()
-	for {
-		select {
-		case pack := <-c:
-			goPool.Go(func() {
-				if ipLayer := pack.Packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
-					ipv4 := ipLayer.(*layers.IPv4)
+						if tcpLayer := pack.Packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+							tcp := tcpLayer.(*layers.TCP)
 
-					if tcpLayer := pack.Packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
-						tcp := tcpLayer.(*layers.TCP)
-						sp := int(tcp.SrcPort)
-						// fmt.Printf("%v,%v\n", sp, tcp)
-						if v, ok := getTcpOptionsRaw(sp); ok {
-							if tcp.ACK && len(tcp.Payload) == 0 {
-								v.lock.Lock()
+							sp := int(tcp.SrcPort)
 
-								defer v.lock.Unlock()
-								defer v.cond.Broadcast()
-								defer closeTcpOptions(sp)
-
+							// fmt.Printf("%v,%v\n", sp, tcp)
+							if v, ok := getTcpOptions(sp); ok && tcp.ACK {
+								// fmt.Printf("%v,%v\n", sp, v)
 								tcp.Options = append(tcp.Options, layers.TCPOption{
 									OptionType:   optionType,
-									OptionLength: uint8(len(v.v) + 2),
-									OptionData:   v.v[:],
+									OptionLength: uint8(len(v) + 2),
+									OptionData:   v,
 								})
 
 								var options gopacket.SerializeOptions = gopacket.SerializeOptions{
@@ -195,6 +185,7 @@ func (n *netFilter) Run() {
 								err := tcp.SetNetworkLayerForChecksum(ipv4)
 
 								if err != nil {
+									closeTcpOptions(sp)
 									fmt.Fprintf(os.Stderr, "SetNetworkLayerForChecksum err: %v\n", err)
 									return
 								}
@@ -205,32 +196,46 @@ func (n *netFilter) Run() {
 								)
 
 								if err != nil {
+									closeTcpOptions(sp)
 									fmt.Fprintf(os.Stderr, "SerializeLayers err: %v\n", err)
 									return
 								}
 								pack.SetVerdictWithPacket(netfilter.NF_ACCEPT, buffer.Bytes())
-							} else if !tcp.SYN {
-								v.lock.Lock()
-								for hasTcpOptions(sp) {
-									v.cond.Wait()
-								}
-								pack.SetVerdict(netfilter.NF_ACCEPT)
-								v.lock.Unlock()
+								closeTcpOptions(sp)
 							} else {
 								pack.SetVerdict(netfilter.NF_ACCEPT)
 							}
-							// fmt.Printf("%v,%v\n", sp, v)
-						} else {
-							pack.SetVerdict(netfilter.NF_ACCEPT)
 						}
+					} else {
+						pack.SetVerdict(netfilter.NF_ACCEPT)
 					}
+				}
+			}
+		}()
+	}
+
+	// goPool := pool.New().WithMaxGoroutines(1)
+	c := n.q.GetPackets()
+	for {
+		select {
+		case pack := <-c:
+			if ipLayer := pack.Packet.Layer(layers.LayerTypeIPv4); ipLayer != nil {
+
+				if tcpLayer := pack.Packet.Layer(layers.LayerTypeTCP); tcpLayer != nil {
+					tcp := tcpLayer.(*layers.TCP)
+
+					sp := int(tcp.SrcPort)
+					index := sp % opt.maxGoroutines
+					channels[index] <- &pack
 				} else {
 					pack.SetVerdict(netfilter.NF_ACCEPT)
 				}
-			})
+			} else {
+				pack.SetVerdict(netfilter.NF_ACCEPT)
+			}
 		}
 	}
-	goPool.Wait()
+	// goPool.Wait()
 }
 
 func initIptables() error {
@@ -255,7 +260,8 @@ func clearIptables() error {
 }
 
 func getAvailableAddr() (net.Addr, error) {
-
+	mu.Lock()
+	defer mu.Unlock()
 	l, err := net.ListenTCP("tcp", nil)
 	if err != nil {
 		return nil, err
@@ -269,9 +275,10 @@ func newTcpOptions(srcPort int, ip net.IP, port int) error {
 	toaLock.Lock()
 	defer toaLock.Unlock()
 
+	if _, ok := c.Get(strconv.Itoa(srcPort)); ok {
+		return errors.New("exists")
+	}
 	tcpOptions := tcpOptionsPool.Get().(*tcpOptions)
-	tcpOptions.use = true
-
 	binary.BigEndian.PutUint16(tcpOptions.v[:2], uint16(port))
 	copy(tcpOptions.v[2:], ip.To4())
 	c.SetDefault(strconv.Itoa(srcPort), tcpOptions)
@@ -279,25 +286,10 @@ func newTcpOptions(srcPort int, ip net.IP, port int) error {
 	return nil
 }
 
-func getTcpOptionsRaw(srcPort int) (*tcpOptions, bool) {
-	toaLock.RLock()
-	defer toaLock.RUnlock()
-
-	k := strconv.Itoa(srcPort)
-	if v, ok := c.Get(k); ok {
-		o := v.(*tcpOptions)
-		return o, ok
-	}
-	return nil, false
-}
-
-func hasTcpOptions(srcPort int) bool {
-	k := strconv.Itoa(srcPort)
-	_, ok := c.Get(k)
-	return ok
-}
-
 func getTcpOptions(srcPort int) ([]byte, bool) {
+	// toaLock.RLock()
+	// defer toaLock.RUnlock()
+
 	k := strconv.Itoa(srcPort)
 	if v, ok := c.Get(k); ok {
 		o := v.(*tcpOptions)
@@ -311,12 +303,24 @@ func closeTcpOptions(srcPort int) {
 	defer toaLock.Unlock()
 
 	k := strconv.Itoa(srcPort)
+
 	if v, ok := c.Get(k); ok {
-		c.Delete(k)
-		tcpOptionsPool.Put(v)
+		o := v.(*tcpOptions)
+		if o.c >= 2 {
+			o.c = 0
+			c.Delete(k)
+			tcpOptionsPool.Put(v)
+		} else {
+			o.c += 1
+		}
+
 	}
 }
 
-func close() error {
-	return clearIptables()
+func cl() error {
+	err := clearIptables()
+	for _, v := range channels {
+		close(v)
+	}
+	return err
 }
