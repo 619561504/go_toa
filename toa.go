@@ -36,7 +36,7 @@ func WithMaxGoroutines(maxGoroutines int) Option {
 }
 
 func WithMaxRetry(maxRetry int) Option {
-	return func(options *options) {
+	return func(opt *options) {
 		opt.maxRetry = maxRetry
 	}
 }
